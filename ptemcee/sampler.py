@@ -140,6 +140,7 @@ class LikePriorEvaluator(object):
 
         return ll, lp
 
+
 class Sampler(object):
     """
     A parallel-tempered ensemble sampler, using :class:`EnsembleSampler`
@@ -210,7 +211,9 @@ class Sampler(object):
             self._random = random
 
         self._likeprior = LikePriorEvaluator(logl, logp, loglargs, logpargs, loglkwargs, logpkwargs)
-        self.a = a
+        self.move_kwargs = dict(a=a, gamma=2.38, sigma=1e-5)
+        self.moves = [stretch_move, differential_move, normal_move]
+        self.move_idx = 0
         self.nwalkers = nwalkers
         self.dim = dim
         self.adaptation_time = adaptation_time
@@ -325,24 +328,24 @@ class Sampler(object):
         # Set initial walker positions.
         if p0 is not None:
             # Start anew.
-            self._p0 = p = np.array(p0).copy()
+            self._p0 = current_point = np.array(p0).copy()
             self._logposterior0 = None
             self._loglikelihood0 = None
         elif self._p0 is not None:
             # Now, where were we?
-            p = self._p0
+            current_point = self._p0
         else:
             raise ValueError('Initial walker positions not specified.')
 
         # Check for dodgy inputs.
-        if np.any(np.isinf(p)):
+        if np.any(np.isinf(current_point)):
             raise ValueError('At least one parameter value was infinite.')
-        if np.any(np.isnan(p)):
+        if np.any(np.isnan(current_point)):
             raise ValueError('At least one parameter value was NaN.')
 
         # If we have no likelihood or prior values, compute them.
         if self._logposterior0 is None or self._loglikelihood0 is None:
-            logl, logp = self._evaluate(p)
+            logl, logp = self._evaluate(current_point)
             logpost = self._tempered_likelihood(logl) + logp
 
             self._loglikelihood0 = logl
@@ -359,50 +362,38 @@ class Sampler(object):
             isave = self._expand_chain(iterations // thin)
 
         for i in range(iterations):
+            _old_chain = np.sort(current_point.copy().flatten())
             for j in [0, 1]:
                 # Get positions of walkers to be updated and walker to be sampled.
                 jupdate = j
                 jsample = (j + 1) % 2
-                pupdate = p[:, jupdate::2, :]
-                psample = p[:, jsample::2, :]
+                pupdate = current_point[:, jupdate::2, :]
+                psample = current_point[:, jsample::2, :]
 
-                zs = np.exp(self._random.uniform(low=-np.log(self.a),
-                                                 high=np.log(self.a),
-                                                 size=(self.ntemps, self.nwalkers//2)))
-
-                qs = np.zeros((self.ntemps, self.nwalkers//2, self.dim))
-                for k in range(self.ntemps):
-                    js = self._random.randint(0, high=self.nwalkers // 2,
-                                              size=self.nwalkers // 2)
-                    qs[k, :, :] = psample[k, js, :] + zs[k, :].reshape(
-                        (self.nwalkers // 2, 1)) * (pupdate[k, :, :] -
-                                                   psample[k, js, :])
-
-                qslogl, qslogp = self._evaluate(qs)
+                ln_jacobians, new_positions = self.move(
+                    psample, pupdate, self.ntemps, self.nwalkers, self.dim, self._random, self.move_kwargs
+                )
+                qslogl, qslogp = self._evaluate(new_positions)
                 qslogpost = self._tempered_likelihood(qslogl) + qslogp
 
-                logpaccept = self.dim*np.log(zs) + qslogpost \
-                    - logpost[:, jupdate::2]
-                logr = np.log(self._random.uniform(low=0.0, high=1.0,
-                                                   size=(self.ntemps,
-                                                         self.nwalkers//2)))
+                logpaccept = ln_jacobians + qslogpost - logpost[:, jupdate::2]
+                logr = np.log(self._random.uniform(
+                    low=0.0, high=1.0, size=(self.ntemps, self.nwalkers//2)
+                ))
 
                 accepts = logr < logpaccept
                 accepts = accepts.flatten()
 
-                pupdate.reshape((-1, self.dim))[accepts, :] = \
-                    qs.reshape((-1, self.dim))[accepts, :]
-                logpost[:, jupdate::2].reshape((-1,))[accepts] = \
-                    qslogpost.reshape((-1,))[accepts]
-                logl[:, jupdate::2].reshape((-1,))[accepts] = \
-                    qslogl.reshape((-1,))[accepts]
+                pupdate.reshape((-1, self.dim))[accepts, :] = new_positions.reshape((-1, self.dim))[accepts, :]
+                logpost[:, jupdate::2].reshape((-1,))[accepts] = qslogpost.reshape((-1,))[accepts]
+                logl[:, jupdate::2].reshape((-1,))[accepts] = qslogl.reshape((-1,))[accepts]
 
                 accepts = accepts.reshape((self.ntemps, self.nwalkers//2))
 
                 self.nprop[:, jupdate::2] += 1.0
                 self.nprop_accepted[:, jupdate::2] += accepts
 
-            p, ratios = self._temperature_swaps(self._betas, p, logpost, logl)
+            current_point, ratios = self._temperature_swaps(self._betas, current_point, logpost, logl)
 
             # TODO Should the notion of a "complete" iteration really include the temperature
             # adjustment?
@@ -413,7 +404,7 @@ class Sampler(object):
 
             if (self._time + 1) % thin == 0:
                 if storechain:
-                    self._chain[:, :, isave, :] = p
+                    self._chain[:, :, isave, :] = current_point
                     self._logposterior[:, :, isave] = logpost
                     self._loglikelihood[:, :, isave] = logl
                     self._beta_history[:, isave] = self._betas
@@ -421,9 +412,14 @@ class Sampler(object):
 
             self._time += 1
             if swap_ratios:
-                yield p, logpost, logl, ratios
+                yield current_point, logpost, logl, ratios
             else:
-                yield p, logpost, logl
+                yield current_point, logpost, logl
+    
+    @property
+    def move(self):
+        self.move_idx = (self.move_idx + 1) % len(self.moves)
+        return self.moves[self.move_idx]
 
     def _evaluate(self, ps):
         mapf = map if self.pool is None else self.pool.map
@@ -724,3 +720,72 @@ class Sampler(object):
             x = np.mean(self._chain[i, :, :, :], axis=0)
             acors[i, :] = util.autocorr_integrated_time(x, window=window)
         return acors
+
+
+def stretch_move(psample, pupdate, ntemps, nwalkers, dim, _random, move_kwargs):
+    scale = move_kwargs.get("a", 2)
+    scales = np.exp(_random.uniform(
+        low=-np.log(scale), high=np.log(scale), size=(ntemps, nwalkers // 2)
+    ))
+
+    new_positions = np.zeros((ntemps, nwalkers // 2, dim))
+    for k in range(ntemps):
+        js = _random.randint(0, high=nwalkers // 2, size=nwalkers // 2)
+        new_positions[k, :, :] = (
+            psample[k, js, :]
+            + scales[k, :].reshape((nwalkers // 2, 1))
+            * (pupdate[k, :, :] - psample[k, js, :])
+        )
+
+    ln_jacobians = dim * np.log(scales)
+    
+    return ln_jacobians, new_positions
+
+
+def differential_move(psample, pupdate, ntemps, nwalkers, dim, _random, move_kwargs):
+    sigma = move_kwargs.get("sigma", 1e-5)
+
+    new_positions = np.zeros((ntemps, nwalkers // 2, dim))
+    shifts = _random.normal(size=(ntemps, nwalkers // 2, dim)) * sigma
+    if _random.uniform(0, 1) < 0.5:
+        scale = 1
+    else:
+        gamma = move_kwargs.get("gamma", 2.38 / np.sqrt(2 * dim))
+        scale = _random.normal() * gamma
+    for k in range(ntemps):
+        j1s = _random.randint(0, high=nwalkers // 2, size=nwalkers // 2)
+        j2s = _random.randint(0, high=nwalkers // 2, size=nwalkers // 2)
+        new_positions[k, :, :] = (
+            pupdate[k, :, :]
+            + shifts[k]
+            + scale * (psample[k, j1s, :] - psample[k, j2s, :]) 
+        )
+
+    return 0, new_positions
+
+
+def normal_move(psample, pupdate, ntemps, nwalkers, dim, _random, move_kwargs):
+    new_positions = np.zeros((ntemps, nwalkers // 2, dim))
+    sigmas = np.std(psample[:, :, :], axis=1)
+    shifts = _random.normal(size=(ntemps, nwalkers // 2, dim))
+    for k in range(ntemps):
+        new_positions[k, :, :] = pupdate[k, :, :] + shifts[k] * sigmas[k]
+
+    return 0, new_positions
+
+
+def multivariate_normal_move(psample, pupdate, ntemps, nwalkers, dim, _random, move_kwargs):
+    """FIXME: this is broken"""
+    try:
+        from sklearn.covariance import EmpiricalCovariance
+    except ImportError:
+        return normal_move(psample, pupdate, ntemps, nwalkers, dim, _random, move_kwargs)
+    new_positions = np.zeros((ntemps, nwalkers // 2, dim))
+    shifts = _random.normal(size=(ntemps, nwalkers // 2, dim))
+    for k in range(ntemps):
+        cov = EmpiricalCovariance().fit(psample[k, :, :])
+        shifts = cov.location_ + np.dot(cov.precision_, shifts[k].T).T
+        new_positions[k, :, :] = pupdate[k, :, :] + shifts
+
+    return 0, new_positions
+
