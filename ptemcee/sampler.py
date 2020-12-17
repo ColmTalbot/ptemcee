@@ -1,9 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from __future__ import (division, print_function, absolute_import,
-                        unicode_literals)
-
 __all__ = ["Sampler", "default_beta_ladder"]
 
 import numpy as np
@@ -204,6 +201,7 @@ class Sampler(object):
                  loglargs=[], logpargs=[],
                  loglkwargs={}, logpkwargs={},
                  adaptation_lag=10000, adaptation_time=100,
+                 moves=None,
                  random=None):
         if random is None:
             self._random = np.random.mtrand.RandomState()
@@ -212,8 +210,7 @@ class Sampler(object):
 
         self._likeprior = LikePriorEvaluator(logl, logp, loglargs, logpargs, loglkwargs, logpkwargs)
         self.move_kwargs = dict(a=a, gamma=2.38, sigma=1e-5)
-        self.moves = [stretch_move, differential_move, normal_move]
-        self.move_idx = 0
+        self.move = moves
         self.nwalkers = nwalkers
         self.dim = dim
         self.adaptation_time = adaptation_time
@@ -418,8 +415,29 @@ class Sampler(object):
     
     @property
     def move(self):
-        self.move_idx = (self.move_idx + 1) % len(self.moves)
-        return self.moves[self.move_idx]
+        return np.random.choice(self._moves, p=self._weights)
+
+    @move.setter
+    def move(self, moves):
+        if moves is not None:
+            if isinstance(moves, list):
+                try:
+                    self._moves, self._weights = zip(*moves)
+                    self._weights = np.array(self._weights)
+                    self._weights = self._weights / np.sum(self._weights)
+                except:
+                    self._moves = moves
+                    self._weights = np.ones(len(moves)) / len(moves)
+            elif isinstance(moves, dict):
+                self._moves = [key for key in moves]
+                self._weights = np.array([moves[key] for key in moves])
+                self._weights = self._weights / np.sum(self._weights)
+            else:
+                self._moves = [stretch_move, differential_move, normal_move]
+                self._weights = np.array([1 / 3, 1 / 3, 1 / 3])
+        else:
+            self._moves = [stretch_move, differential_move, normal_move]
+            self._weights = np.array([1 / 3, 1 / 3, 1 / 3])
 
     def _evaluate(self, ps):
         mapf = map if self.pool is None else self.pool.map
